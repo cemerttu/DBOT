@@ -32,6 +32,14 @@ What the signal means
   UNSUITABLE = volatility is abnormal, or the backtest loses money.
   WAIT       = still collecting data, a spike just happened, or volatility is changing.
 
+When to enter and when to stop (new)
+  ENTER NOW  appears when the backtest is not losing, volatility is normal, there was no
+             recent spike, and the market has been calm for CALM_TICKS ticks in a row.
+  CLOSE NOW  appears after TARGET_TICKS ticks (take profit), or when a tick comes close
+             to the barrier (NEAR_MISS), or when volatility turns hot.
+  The bot follows its own signals with a VIRTUAL position and keeps score of what would
+  have happened, so you can see whether the rules help. No real trade is ever placed.
+
 Honest warning: Volatility indices are generated with constant volatility, so spikes
 and "conditions" are mostly noise and cannot predict the next tick. An accumulator
 loses its whole stake the moment one tick breaks the barrier.
@@ -39,6 +47,8 @@ loses its whole stake the moment one tick breaks the barrier.
 
 import csv
 import json
+import math
+import os
 import ssl
 import statistics
 import sys
@@ -82,6 +92,15 @@ SHOW_EVERY = 10           # seconds between dashboard prints
 BARRIER_REFRESH = 120     # seconds between asking Deriv for barrier quotes
 CSV_FILE = "deriv_ticks_accumulator.csv"
 
+# ENTRY AND EXIT RULES
+TARGET_TICKS = HOLD_TICKS   # take profit: close after this many ticks
+CALM_TICKS = 5              # entry needs this many calm ticks in a row
+CALM_FRAC = 0.5             # a tick is "calm" if it moved less than this x the barrier
+NEAR_MISS = 0.8             # close if a tick moves this x the barrier or more
+REQUIRE_SUITABLE = True     # False = ignore the backtest/volatility gate for entries
+USE_COLOR = True
+SOUND = True
+
 URLS = [
     "wss://api.derivws.com/trading/v1/options/ws/public",
     "wss://ws.derivws.com/websockets/v3?app_id=1089",
@@ -98,6 +117,19 @@ deriv_barrier = {}                 # (market, growth) -> barrier distance in pri
 proposal_ids = {}                  # req_id -> (market, growth)
 proposal_error_shown = False
 NORMAL = statistics.NormalDist()
+
+# Deriv's newer endpoint calls the market field "underlying_symbol";
+# the older endpoint calls it "symbol".
+SYMBOL_FIELD = ["underlying_symbol"]
+symbol_toggled = [False]
+requote_now = [False]
+
+latest = {m: None for m in MARKETS}          # last full analysis
+calm_run = {m: 0 for m in MARKETS}           # calm ticks in a row
+spike_age = {m: 999 for m in MARKETS}        # ticks since the last spike
+rearm = {m: True for m in MARKETS}           # may a new entry start?
+position = {m: None for m in MARKETS}        # virtual position, or None
+vrecord = {m: {"n": 0, "profit": 0, "broken": 0, "net": 0.0} for m in MARKETS}
 
 
 # ---------------------------------------------------------------------
@@ -201,7 +233,7 @@ def request_barriers(ws):
             ws.send(json.dumps({
                 "proposal": 1, "amount": 10, "basis": "stake",
                 "contract_type": "ACCU", "currency": "USD",
-                "symbol": m, "growth_rate": g, "req_id": rid,
+                SYMBOL_FIELD[0]: m, "growth_rate": g, "req_id": rid,
             }))
 
 
@@ -221,6 +253,240 @@ def parse_barrier(msg):
 # ---------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Entry and exit rules
+# ---------------------------------------------------------------------
+def c(text, code):
+    """Colour text for the terminal (set USE_COLOR = False to turn off)."""
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def plan(m):
+    """Growth rate and barrier the bot would use for this index right now."""
+    a = latest[m]
+    if a is None:
+        return None
+    g = a["best_g"]
+    r = a["rows"][g]
+    return {"g": g, "barrier": r["barrier"], "src": r["source"]}
+
+
+def sync_state(results):
+    for m in MARKETS:
+        latest[m] = results[m]
+        a = results[m]
+        if a is not None and spike_age[m] == 999 and a["since_spike"] is not None:
+            spike_age[m] = a["since_spike"]
+
+
+def entry_ready(m):
+    """(True, 'ready') or (False, reason) for starting a new position."""
+    a = latest[m]
+    if a is None or a["n"] < MIN_TICKS:
+        return False, "collecting data"
+    if REQUIRE_SUITABLE:
+        if a["vol_ratio"] > VOL_BAD:
+            return False, "volatility is abnormal"
+        if a["best_ev"] < -EV_TOLERANCE:
+            return False, (f"backtest loses money ({a['best_ev']:+.3f} per 1.00, "
+                           f"limit -{EV_TOLERANCE:.2f})")
+    if a["vol_ratio"] > VOL_WAIT:
+        return False, "volatility is rising"
+    if spike_age[m] < SPIKE_COOLDOWN:
+        return False, f"spike {spike_age[m]} ticks ago"
+    if calm_run[m] < CALM_TICKS:
+        return False, f"waiting for calm ({calm_run[m]}/{CALM_TICKS} ticks)"
+    if not rearm[m]:
+        return False, "waiting for the next calm period"
+    return True, "ready"
+
+
+def after_tick(m, change):
+    """Runs on every live tick: update calm/spike counters, manage the position."""
+    d = abs(change)
+    sigma = cached_sigma[m]
+
+    if sigma and d > SPIKE_SIGMA * sigma:
+        spike_age[m] = 0
+    else:
+        spike_age[m] += 1
+
+    p = plan(m)
+    if p is None:
+        return
+
+    if d < CALM_FRAC * p["barrier"]:
+        calm_run[m] += 1
+    else:
+        calm_run[m] = 0
+        rearm[m] = True
+
+    pos = position[m]
+    if pos is not None:
+        manage_position(m, pos, d)
+        return
+
+    ok, _ = entry_ready(m)
+    if ok:
+        open_position(m, p)
+
+
+def open_position(m, p):
+    position[m] = {"g": p["g"], "barrier": p["barrier"], "src": p["src"], "held": 0}
+    rearm[m] = False
+    a = latest[m]
+    since = "a long time" if spike_age[m] >= 999 else f"{spike_age[m]} ticks"
+    if SOUND:
+        print("\a", end="")
+    print()
+    print(c("=" * 72, "92"))
+    print(c(f" ENTER NOW   {MARKETS[m]}   (analysis only, no trade placed)", "92;1"))
+    print(c("=" * 72, "92"))
+    print(f" Growth rate : {p['g'] * 100:.0f}%")
+    print(f" Barrier     : {p['barrier']:.5f} either side of the price ({p['src']})")
+    print(f" Why         : {CALM_TICKS} calm ticks in a row, no spike for {since}, "
+          f"volatility {a['vol_ratio']:.2f}x normal")
+    print(f" Plan        : hold up to {TARGET_TICKS} ticks "
+          f"(stake would grow to {(1 + p['g']) ** TARGET_TICKS:.2f}x)")
+    print(f" CLOSE when  : {TARGET_TICKS} ticks pass, or a tick reaches "
+          f"{NEAR_MISS * 100:.0f}% of the barrier, or volatility turns hot")
+    print(c(" Risk        : one tick beyond the barrier loses the WHOLE stake.", "93"))
+    print(c("=" * 72, "92"), flush=True)
+
+
+def manage_position(m, pos, d):
+    pos["held"] += 1
+    held = pos["held"]
+    value = (1 + pos["g"]) ** held
+    a = latest[m]
+
+    if d >= pos["barrier"]:
+        close_position(m, pos, "a tick went beyond the barrier, the stake is lost",
+                       -1.0, broken=True)
+    elif d >= NEAR_MISS * pos["barrier"]:
+        close_position(m, pos, "NEAR MISS: a tick came close to the barrier", value - 1)
+    elif a is not None and a["vol_ratio"] > VOL_WAIT:
+        close_position(m, pos, "volatility turned hot", value - 1)
+    elif held >= TARGET_TICKS:
+        close_position(m, pos, "target reached, take profit", value - 1)
+
+
+def close_position(m, pos, reason, result, broken=False):
+    position[m] = None
+    r = vrecord[m]
+    r["n"] += 1
+    r["net"] += result
+    r["broken" if broken else "profit"] += 1
+    colour = "91" if broken else "93"
+    title = "BARRIER BROKEN" if broken else "CLOSE NOW"
+    if SOUND:
+        print("\a", end="")
+    print()
+    print(c("=" * 72, colour))
+    print(c(f" {title}   {MARKETS[m]}   (analysis only, no trade placed)", colour + ";1"))
+    print(c("=" * 72, colour))
+    print(f" Reason      : {reason}")
+    print(f" Held        : {pos['held']} ticks")
+    print(f" Result      : {result * 100:+.1f}% of the stake (virtual)")
+    if broken:
+        print(" Note        : in a real trade this loss happens instantly; "
+              "no signal can prevent it.")
+    print(c("=" * 72, colour), flush=True)
+
+
+def entry_evidence(m):
+    """
+    Did entering after CALM_TICKS calm ticks survive TARGET_TICKS ticks more often
+    than entering on any tick? Returns (rate_rule, n_rule, rate_all, verdict).
+    """
+    p = plan(m)
+    if p is None:
+        return None
+    changes = tick_changes(m)
+    n = len(changes)
+    hold = TARGET_TICKS
+    barrier = p["barrier"]
+    if n < hold + 100:
+        return None
+
+    prefix = [0]
+    for x in changes:
+        prefix.append(prefix[-1] + (1 if abs(x) >= barrier else 0))
+
+    run = 0
+    all_s = all_n = rule_s = rule_n = 0
+    for i in range(n - hold + 1):
+        survived = (prefix[i + hold] - prefix[i]) == 0
+        all_n += 1
+        all_s += survived
+        if run >= CALM_TICKS:
+            rule_n += 1
+            rule_s += survived
+        run = run + 1 if abs(changes[i]) < CALM_FRAC * barrier else 0
+
+    if all_n == 0 or rule_n == 0:
+        return None
+    rate_all = all_s / all_n
+    rate_rule = rule_s / rule_n
+    independent = rule_n / hold          # overlapping entries are not independent
+    if independent < 30:
+        verdict = "not enough calm entries to judge"
+    else:
+        se = math.sqrt(max(rate_all * (1 - rate_all), 1e-9) / independent)
+        verdict = ("rule supported by history" if rate_rule > rate_all + 3 * se
+                   else "no measurable effect")
+    return rate_rule, rule_n, rate_all, verdict
+
+
+def show_plan():
+    print("WHEN TO ENTER AND WHEN TO STOP")
+    print(f"  ENTER : backtest not losing, volatility normal, no recent spike, and "
+          f"{CALM_TICKS} calm ticks in a row")
+    print(f"          (a calm tick moves less than {CALM_FRAC * 100:.0f}% of the barrier)")
+    print(f"  STOP  : close after {TARGET_TICKS} ticks, OR a tick reaches "
+          f"{NEAR_MISS * 100:.0f}% of the barrier, OR volatility turns hot")
+    print()
+    print(f"  {'INDEX':<16}NOW")
+    for m, name in MARKETS.items():
+        pos = position[m]
+        if pos is not None:
+            held = pos["held"]
+            line = c(f"IN POSITION: held {held}/{TARGET_TICKS} ticks, stake value "
+                     f"{(1 + pos['g']) ** held:.2f}x", "92;1")
+        else:
+            ok, why = entry_ready(m)
+            line = c("ready: entry fires on the next calm tick", "92") if ok else f"wait: {why}"
+        print(f"  {name:<16}{line}")
+
+    print()
+    print(f"  Does the entry rule work? (survived {TARGET_TICKS} ticks in the stored history)")
+    for m, name in MARKETS.items():
+        ev = entry_evidence(m)
+        if ev is None:
+            print(f"    {name:<16}not enough data yet")
+        else:
+            rate_rule, n_rule, rate_all, verdict = ev
+            print(f"    {name:<16}after calm {rate_rule * 100:.1f}% (n={n_rule})   "
+                  f"any tick {rate_all * 100:.1f}%   {verdict}")
+
+    print()
+    total = sum(v["n"] for v in vrecord.values())
+    print("  IF YOU HAD FOLLOWED THE SIGNALS (virtual, since the bot started)")
+    if total == 0:
+        print("    no completed virtual trades yet")
+    else:
+        for m, name in MARKETS.items():
+            v = vrecord[m]
+            if v["n"]:
+                print(f"    {name:<16}{v['n']} trades, {v['profit']} closed in profit, "
+                      f"{v['broken']} broken, net {v['net']:+.2f} per 1.00 staked")
+        net = sum(v["net"] for v in vrecord.values())
+        broken = sum(v["broken"] for v in vrecord.values())
+        print(f"    {'ALL':<16}{total} trades, {broken} broken, net {net:+.2f} "
+              f"(average {net / total:+.3f} per trade)")
+    print("  " + "=" * 90, flush=True)
+
+
 def fmt_since(v):
     return "-" if v is None else str(v)
 
@@ -314,6 +580,8 @@ def on_tick(msg, writer):
     if prev is not None and sigma and abs(price - prev) > SPIKE_SIGMA * sigma:
         print(f"[SPIKE] {MARKETS[m]}: tick moved {price - prev:+.5f} "
               f"({abs(price - prev) / sigma:.1f} std-devs)")
+    if prev is not None:
+        after_tick(m, price - prev)
 
 
 def on_proposal(msg):
@@ -322,6 +590,14 @@ def on_proposal(msg):
     if key is None:
         return
     if "error" in msg:
+        err0 = msg["error"]
+        text0 = str(err0.get("message", err0)) if isinstance(err0, dict) else str(err0)
+        if (not symbol_toggled[0] and "validation" in text0.lower() and "symbol" in text0):
+            SYMBOL_FIELD[0] = ("symbol" if SYMBOL_FIELD[0] == "underlying_symbol"
+                               else "underlying_symbol")
+            symbol_toggled[0] = True
+            requote_now[0] = True
+            return
         if not proposal_error_shown:
             err = msg["error"]
             print("[BARRIER] Deriv did not give a barrier quote "
@@ -346,6 +622,8 @@ def connect():
             ws = websocket.create_connection(url, timeout=20, sslopt=opts)
             ws.settimeout(2)
             print("[CONNECTED]", url)
+            SYMBOL_FIELD[0] = ("underlying_symbol" if "api.derivws.com" in url else "symbol")
+            symbol_toggled[0] = False
             return ws
         except Exception as exc:
             print("[CONNECTION FAILED]", exc)
@@ -357,6 +635,11 @@ def run(ws, writer, f):
         ws.send(json.dumps({"ticks_history": m, "count": HISTORY, "end": "latest",
                             "style": "ticks", "subscribe": 1}))
     request_barriers(ws)
+    for mk in MARKETS:
+        position[mk] = None
+        calm_run[mk] = 0
+        spike_age[mk] = 999
+        rearm[mk] = True
     now = time.time()
     last_show = last_ping = 0.0
     last_barrier = now
@@ -385,16 +668,24 @@ def run(ws, writer, f):
         if now - last_ping > 30:
             ws.send(json.dumps({"ping": 1}))
             last_ping = now
+        if requote_now[0]:
+            request_barriers(ws)
+            requote_now[0] = False
+            last_barrier = now
         if now - last_barrier > BARRIER_REFRESH:
             request_barriers(ws)
             last_barrier = now
         if now - last_show >= SHOW_EVERY:
-            show({m: analyse(m) for m in MARKETS})
+            results = {m: analyse(m) for m in MARKETS}
+            sync_state(results)
+            show(results)
+            show_plan()
             f.flush()
             last_show = now
 
 
 def main():
+    os.system("")  # lets Windows terminals show colours
     print("DERIV ACCUMULATOR CONDITIONS ANALYSER | analysis only, no trades")
     with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)

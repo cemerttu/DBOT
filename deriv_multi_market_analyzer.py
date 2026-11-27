@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
 """
-DERIV TOUCH / NO TOUCH ANALYZER
+DERIV MULTI-MARKET ANALYZER (with tick DURATION)
 READ-ONLY: No trades are placed.
 
-What it does
-------------
-1. Reads live ticks for R_10 / R_25 / R_50 / R_75 / R_100.
-2. Measures how much each market normally moves per tick.
-3. For several barrier distances and tick durations, it estimates the
-   chance that the price TOUCHES the barrier (and the chance it does not).
-4. Asks Deriv for the real payout of each option and works out the
-   expected value per $1 staked:
+Markets:
+R_10, R_25, R_50, R_75, R_100
 
-       value = chance_of_winning x payout_ratio - 1
+Contracts:
+OVER 1 / UNDER 8
 
-   A negative value means the option loses money on average.
-
-The bot cannot predict direction. These markets are random walks, so it
-only checks whether a payout is fair.
+New: after every trigger (a miss) the bot tracks what happens at
+1, 2, 3, 4 and 5 ticks AFTER the entry signal, and shows the
+duration (in ticks) with the best completed record.
 
 Install:
 python -m pip install websocket-client certifi
 
 Run:
-python deriv_touch_analyzer.py
+python deriv_multi_market_analyzer.py
 """
 
+import csv
 import json
 import math
 import os
@@ -33,7 +28,8 @@ import ssl
 import sys
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 try:
     import websocket
@@ -55,45 +51,48 @@ except ImportError:
 # ============================================================
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"]
+CONTRACTS = ["OVER 1", "UNDER 8"]
 
-# Contract lengths to test, in ticks (check Deriv for the lengths it
-# offers for Touch / No Touch on each market).
-TICK_DURATIONS = [5, 10]
+# Durations (in ticks) to test after each signal.
+DURATIONS = [1, 2, 3, 4, 5]
+MAX_DURATION = max(DURATIONS)
 
-# Barrier distance in "standard deviations of the move over the contract".
-# 0.75 = close barrier (touch is likely), 2.0 = far barrier (unlikely).
-Z_LEVELS = [0.75, 1.0, 1.5, 2.0]
+# Minimum completed signals before a duration can be called "best".
+MIN_SAMPLES = 20
 
-WINDOW = 1500          # ticks of history kept per market
-SIGMA_WINDOW = 500     # ticks used to measure normal movement
+# A duration is only called an edge if its win rate beats the plain
+# hit rate by this many standard errors (3 = very unlikely to be luck).
+EDGE_SIGMA = 3
 
-STAKE = 10
-CURRENCY = "USD"
+# How many recent tick gaps are averaged to get seconds per tick.
+GAP_SAMPLES = 200
 
-SHOW_EVERY = 15        # seconds between screen updates
-PROPOSAL_EVERY = 60    # seconds between payout lookups
+# Display options
+USE_COLOR = True    # coloured terminal text
+SOUND = True        # beep when an entry signal appears
+VERBOSE = False     # True = also print the detailed statistics tables
+
+# EMA trend: fast EMA above slow EMA = UP, below = DOWN.
+EMA_FAST = 10
+EMA_SLOW = 30
+TRENDS = ["UP", "DOWN", "FLAT"]
+
+# Trend filter: a signal only becomes an ENTRY alert when the EMA trend
+# at signal time is allowed for that contract. Blocked signals are still
+# tracked and recorded, so you can compare filtered vs unfiltered results.
+TREND_FILTER = True
+TREND_RULE = {
+    "OVER 1": ["UP"],
+    "UNDER 8": ["DOWN"],
+}
+
+WINDOW = 500
+SHOW_EVERY = 10
 PING_EVERY = 30
-TOP_N = 8              # rows shown in the options table
 
-# Value alert: model value must be at least this (0.02 = +2%) and the
-# last WINDOW ticks must also show a positive value.
-VALUE_ALERT = 0.02
-
-# Correction because ticks are checked one by one, not continuously.
-DISCRETE_SHIFT = 0.5826
-
-# ENTRY RULE (when to enter)
-# The bot compares how much the market moved over the last RECENT_TICKS
-# ticks with its normal movement:
-#   moving much LESS than normal  -> CALM -> rule says NO TOUCH
-#   moving much MORE than normal  -> WILD -> rule says TOUCH
-RECENT_TICKS = 30
-CALM_RATIO = 0.75      # recent move / normal move below this = CALM
-WILD_RATIO = 1.30      # recent move / normal move above this = WILD
-ENTRY_Z = 1.0          # barrier distance used for the entry suggestion
-
-USE_COLOR = True
-SOUND = True
+TICK_FILE = "deriv_ticks.csv"
+# New file name because the columns changed (duration added).
+SIGNAL_FILE = "deriv_signals_v3.csv"
 
 ENDPOINTS = [
     "wss://api.derivws.com/trading/v1/options/ws/public",
@@ -101,37 +100,677 @@ ENDPOINTS = [
     "wss://ws.derivws.com/websockets/v3?app_id=1089",
 ]
 
+MAX_SEEN = 3000
+
 
 # ============================================================
 # STATE
 # ============================================================
 
-prices = {m: deque(maxlen=WINDOW) for m in MARKETS}
-pip = {m: 2 for m in MARKETS}
+digits = {m: deque(maxlen=WINDOW) for m in MARKETS}
+decimals = {m: 2 for m in MARKETS}
 last_epoch = {m: 0 for m in MARKETS}
 last_price = {m: None for m in MARKETS}
-tick_gaps = {m: deque(maxlen=200) for m in MARKETS}
+tick_gaps = {m: deque(maxlen=GAP_SAMPLES) for m in MARKETS}
+
+ema_fast = {m: None for m in MARKETS}
+ema_slow = {m: None for m in MARKETS}
+
+# trend_record[(market, contract, trend)][duration] = [wins, completed]
+trend_record = {
+    (m, c, t): {d: [0, 0] for d in DURATIONS}
+    for m in MARKETS
+    for c in CONTRACTS
+    for t in TRENDS
+}
 
 history_ready = {m: False for m in MARKETS}
 live_buffer = {m: deque() for m in MARKETS}
 
-# quotes[(market, ticks, z, contract_type)] = payout information
-quotes = {}
-req_map = {}
-req_counter = [0]
-quote_errors = []
+# Active signals still collecting ticks (list per market/contract).
+active = {
+    (m, c): []
+    for m in MARKETS
+    for c in CONTRACTS
+}
+
+# record[(market, contract)][duration] = [wins, completed]
+record = {
+    (m, c): {d: [0, 0] for d in DURATIONS}
+    for m in MARKETS
+    for c in CONTRACTS
+}
+
+seen_pairs = {m: set() for m in MARKETS}
+seen_order = {m: deque() for m in MARKETS}
 
 alerted = set()
-last_regime = {m: None for m in MARKETS}
-
-# Deriv's newer endpoint calls the market field 'underlying_symbol';
-# the older endpoints call it 'symbol'.
-SYMBOL_FIELD = ["underlying_symbol"]
-field_fix = {"toggled": False, "requote": False}
 
 
 # ============================================================
 # HELPERS
+# ============================================================
+
+def utc_string(epoch):
+    return datetime.fromtimestamp(
+        int(epoch), timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def now_utc():
+    return datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def hit(contract, digit):
+    if contract == "OVER 1":
+        return digit > 1
+    if contract == "UNDER 8":
+        return digit < 8
+    return False
+
+
+def last_digit(market, price):
+    precision = decimals[market]
+    quantum = Decimal("1").scaleb(-precision)
+
+    value = Decimal(str(price)).quantize(
+        quantum,
+        rounding=ROUND_HALF_UP
+    )
+
+    text = f"{value:.{precision}f}"
+    return int(text[-1])
+
+
+def is_duplicate(market, epoch, price):
+    key = (int(epoch), str(price))
+
+    if key in seen_pairs[market]:
+        return True
+
+    seen_pairs[market].add(key)
+    seen_order[market].append(key)
+
+    while len(seen_order[market]) > MAX_SEEN:
+        old = seen_order[market].popleft()
+        seen_pairs[market].discard(old)
+
+    return False
+
+
+# ============================================================
+# CSV RECORDS
+# ============================================================
+
+def load_records():
+    try:
+        with open(SIGNAL_FILE, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                market = row.get("market")
+                contract = row.get("contract")
+                win = row.get("win")
+
+                try:
+                    duration = int(row.get("duration", ""))
+                except ValueError:
+                    continue
+
+                key = (market, contract)
+
+                if key not in record:
+                    continue
+
+                if duration not in record[key]:
+                    continue
+
+                if win not in ("0", "1"):
+                    continue
+
+                record[key][duration][1] += 1
+
+                if win == "1":
+                    record[key][duration][0] += 1
+
+                trend_key = (market, contract, row.get("trend"))
+
+                if trend_key in trend_record:
+                    trend_record[trend_key][duration][1] += 1
+
+                    if win == "1":
+                        trend_record[trend_key][duration][0] += 1
+
+        print("Previous signal records loaded.")
+
+    except FileNotFoundError:
+        print("No previous signal file. Starting new record.")
+
+    except Exception as e:
+        print("Signal record loading error:", e)
+
+
+def write_tick(writer, epoch, market, price, digit):
+    writer.writerow([
+        utc_string(epoch),
+        market,
+        price,
+        digit
+    ])
+
+
+def write_signal(
+    writer,
+    market,
+    contract,
+    trigger_epoch,
+    trigger_digit,
+    duration,
+    result_epoch,
+    result_digit,
+    won,
+    trend
+):
+    writer.writerow([
+        utc_string(trigger_epoch),
+        market,
+        contract,
+        trigger_digit,
+        duration,
+        utc_string(result_epoch),
+        result_digit,
+        int(won),
+        trend
+    ])
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+def process_history(market, prices, times):
+    """
+    Historical data initializes the rolling window.
+    It does NOT count as live signal performance.
+    """
+
+    pairs = sorted(
+        zip(prices, times),
+        key=lambda x: int(x[1])
+    )
+
+    digits[market].clear()
+    seen_pairs[market].clear()
+    seen_order[market].clear()
+
+    last_epoch[market] = 0
+    last_price[market] = None
+    tick_gaps[market].clear()
+    ema_fast[market] = None
+    ema_slow[market] = None
+
+    for price, epoch in pairs:
+        epoch = int(epoch)
+        digit = last_digit(market, price)
+        record_gap(market, epoch)
+        update_ema(market, price)
+
+        digits[market].append(digit)
+        last_epoch[market] = epoch
+        last_price[market] = price
+
+        key = (epoch, str(price))
+        seen_pairs[market].add(key)
+        seen_order[market].append(key)
+
+        while len(seen_order[market]) > MAX_SEEN:
+            old = seen_order[market].popleft()
+            seen_pairs[market].discard(old)
+
+    history_ready[market] = True
+
+    print(
+        f"{market}: loaded {len(digits[market])} historical ticks"
+    )
+
+
+# ============================================================
+# LIVE TICK PROCESSING
+# ============================================================
+
+def process_live(
+    market,
+    price,
+    epoch,
+    tick_writer,
+    signal_writer
+):
+    epoch = int(epoch)
+
+    # Do not accept ticks older than current market state.
+    if epoch < last_epoch[market]:
+        return False
+
+    # Prevent exact duplicate ticks on reconnect.
+    if is_duplicate(market, epoch, price):
+        return False
+
+    digit = last_digit(market, price)
+    record_gap(market, epoch)
+    update_ema(market, price)
+
+    # --------------------------------------------------------
+    # SCORE ACTIVE SIGNALS AT EACH DURATION
+    # Tick 1 after the trigger = 1-tick contract result,
+    # tick 2 = 2-tick contract result, and so on.
+    # --------------------------------------------------------
+
+    for contract in CONTRACTS:
+        key = (market, contract)
+        still_active = []
+
+        for signal in active[key]:
+            signal["count"] += 1
+            duration = signal["count"]
+
+            if duration in DURATIONS:
+                won = hit(contract, digit)
+
+                record[key][duration][1] += 1
+
+                if won:
+                    record[key][duration][0] += 1
+
+                trend_key = (market, contract, signal["trend"])
+                trend_record[trend_key][duration][1] += 1
+
+                if won:
+                    trend_record[trend_key][duration][0] += 1
+
+                write_signal(
+                    signal_writer,
+                    market,
+                    contract,
+                    signal["epoch"],
+                    signal["digit"],
+                    duration,
+                    epoch,
+                    digit,
+                    won,
+                    signal["trend"]
+                )
+
+            if duration < MAX_DURATION:
+                still_active.append(signal)
+
+        active[key] = still_active
+
+    # --------------------------------------------------------
+    # STORE CURRENT TICK
+    # --------------------------------------------------------
+
+    digits[market].append(digit)
+    last_epoch[market] = epoch
+    last_price[market] = price
+
+    write_tick(
+        tick_writer,
+        epoch,
+        market,
+        price,
+        digit
+    )
+
+    # --------------------------------------------------------
+    # CREATE NEW SIGNALS AFTER A MISS
+    # --------------------------------------------------------
+
+    for contract in CONTRACTS:
+        key = (market, contract)
+
+        if not hit(contract, digit):
+            active[key].append({
+                "epoch": epoch,
+                "digit": digit,
+                "count": 0,
+                "trend": current_trend(market) or "FLAT"
+            })
+
+    return True
+
+
+# ============================================================
+# ANALYSIS
+# ============================================================
+
+def rate(market, contract):
+    values = digits[market]
+
+    if not values:
+        return 0.0
+
+    wins = sum(
+        1 for d in values
+        if hit(contract, d)
+    )
+
+    return wins / len(values) * 100
+
+
+def ready():
+    return all(
+        len(digits[m]) >= WINDOW
+        for m in MARKETS
+    )
+
+
+def best():
+    choices = [
+        (m, c)
+        for m in MARKETS
+        for c in CONTRACTS
+    ]
+
+    return max(
+        choices,
+        key=lambda x: rate(x[0], x[1])
+    )
+
+
+def fresh_signal(market, contract):
+    """Signal created on the tick that was just processed."""
+    for signal in reversed(active[(market, contract)]):
+        if signal["count"] == 0:
+            return signal
+    return None
+
+
+def update_ema(market, price):
+    """Update fast and slow EMA of the price for this market."""
+    p = float(price)
+
+    for store, length in (
+        (ema_fast, EMA_FAST),
+        (ema_slow, EMA_SLOW)
+    ):
+        prev = store[market]
+
+        if prev is None:
+            store[market] = p
+        else:
+            alpha = 2 / (length + 1)
+            store[market] = alpha * p + (1 - alpha) * prev
+
+
+def current_trend(market):
+    """UP / DOWN / FLAT from fast vs slow EMA (None while warming up)."""
+    fast = ema_fast[market]
+    slow = ema_slow[market]
+
+    if fast is None or slow is None:
+        return None
+
+    if fast > slow:
+        return "UP"
+
+    if fast < slow:
+        return "DOWN"
+
+    return "FLAT"
+
+
+def trend_text(market):
+    return current_trend(market) or "..."
+
+
+def beats_baseline_counts(market, contract, wins, total):
+    """Same edge test as beats_baseline, for any wins/total counts."""
+    if total < MIN_SAMPLES:
+        return False
+
+    baseline = rate(market, contract) / 100
+    observed = wins / total
+    std_err = math.sqrt(baseline * (1 - baseline) / total)
+
+    return observed > baseline + EDGE_SIGMA * std_err
+
+
+def trend_confirms(market, contract, trend=None):
+    """True if the EMA trend allows an entry for this contract."""
+    if not TREND_FILTER:
+        return True
+
+    trend = trend or current_trend(market)
+
+    if trend is None:
+        return False
+
+    return trend in TREND_RULE.get(contract, TRENDS)
+
+
+def confirmed_record(market, contract, duration):
+    """Wins/completed counting only signals the trend filter allows."""
+    allowed = TREND_RULE.get(contract, TRENDS) if TREND_FILTER else TRENDS
+
+    wins = 0
+    total = 0
+
+    for t in allowed:
+        w, n = trend_record[(market, contract, t)][duration]
+        wins += w
+        total += n
+
+    return wins, total
+
+
+def trend_table(market, contract):
+    trend = current_trend(market)
+
+    print()
+    print(
+        f"EMA({EMA_FAST}/{EMA_SLOW}) trend now: "
+        f"{trend or 'warming up'}"
+    )
+    print("Results split by the trend at signal time "
+          "(* = beats baseline):")
+
+    for t in ("UP", "DOWN"):
+        parts = []
+
+        for d in DURATIONS:
+            wins, total = trend_record[(market, contract, t)][d]
+
+            if total == 0:
+                parts.append(f"{d}t: -")
+                continue
+
+            star = (
+                "*"
+                if beats_baseline_counts(market, contract, wins, total)
+                else ""
+            )
+
+            parts.append(
+                f"{d}t: {wins}/{total} "
+                f"({wins / total * 100:.0f}%){star}"
+            )
+
+        marker = "<-- now" if t == trend else ""
+        print(f"  {t:<5}" + "  ".join(parts) + f"  {marker}")
+
+    if TREND_FILTER:
+        allowed = "/".join(TREND_RULE.get(contract, TRENDS))
+        parts = []
+
+        for d in DURATIONS:
+            wins, total = confirmed_record(market, contract, d)
+
+            if total == 0:
+                parts.append(f"{d}t: -")
+                continue
+
+            star = (
+                "*"
+                if beats_baseline_counts(market, contract, wins, total)
+                else ""
+            )
+
+            parts.append(
+                f"{d}t: {wins}/{total} "
+                f"({wins / total * 100:.0f}%){star}"
+            )
+
+        print()
+        print(
+            f"TREND FILTER ON: {contract} enters only when trend is "
+            f"{allowed}"
+        )
+        print(f"  ENTRY-ONLY  " + "  ".join(parts))
+
+
+def record_gap(market, epoch):
+    """Store seconds between this tick and the previous one."""
+    prev = last_epoch[market]
+
+    if prev > 0 and epoch > prev:
+        tick_gaps[market].append(epoch - prev)
+
+
+def avg_gap(market):
+    """Measured average seconds per tick (None until enough data)."""
+    gaps = tick_gaps[market]
+
+    if len(gaps) < 5:
+        return None
+
+    return sum(gaps) / len(gaps)
+
+
+def gap_text(market):
+    gap = avg_gap(market)
+
+    if gap is None:
+        return "..."
+
+    return f"{gap:.1f}s"
+
+
+def duration_label(market, duration):
+    label = f"{duration} tick" + ("s" if duration > 1 else "")
+    gap = avg_gap(market)
+
+    if gap is not None:
+        label += f" (~{duration * gap:.0f}s)"
+
+    return label
+
+
+def beats_baseline(market, contract, duration):
+    """
+    True only if this duration's win rate is higher than the plain
+    hit rate by more than EDGE_SIGMA standard errors.
+    """
+    wins, total = record[(market, contract)][duration]
+
+    if total < MIN_SAMPLES:
+        return False
+
+    baseline = rate(market, contract) / 100
+    observed = wins / total
+    std_err = math.sqrt(baseline * (1 - baseline) / total)
+
+    return observed > baseline + EDGE_SIGMA * std_err
+
+
+def best_duration(market, contract):
+    """
+    Duration (ticks) with the highest completed win rate,
+    only counting durations with at least MIN_SAMPLES results.
+    Returns None if there is not enough data yet.
+    """
+    candidates = []
+
+    for d in DURATIONS:
+        wins, total = record[(market, contract)][d]
+
+        if total >= MIN_SAMPLES:
+            candidates.append((wins / total, total, -d, d))
+
+    if not candidates:
+        return None
+
+    return max(candidates)[3]
+
+
+def record_text(market, contract, duration):
+    wins, total = record[(market, contract)][duration]
+
+    if total == 0:
+        return "No completed signals"
+
+    return (
+        f"{wins}/{total} "
+        f"({wins / total * 100:.2f}%)"
+    )
+
+
+def duration_table(market, contract):
+    best_d = best_duration(market, contract)
+
+    print(
+        f"Plain hit rate (baseline): "
+        f"{rate(market, contract):.2f}%   "
+        f"Tick length: {gap_text(market)}"
+    )
+
+    print(
+        f"{'DURATION':<18}"
+        f"{'RECORD':<24}"
+        f"{'NOTE'}"
+    )
+
+    for d in DURATIONS:
+        note = ""
+
+        if d == best_d:
+            note = "<-- highest so far"
+
+        if beats_baseline(market, contract, d):
+            note = "<-- BEATS BASELINE"
+
+        print(
+            f"{duration_label(market, d):<18}"
+            f"{record_text(market, contract, d):<24}"
+            f"{note}"
+        )
+
+    trend_table(market, contract)
+
+
+def duration_advice(market, contract):
+    best_d = best_duration(market, contract)
+
+    if best_d is None:
+        return (
+            "NOT ENOUGH DATA YET "
+            f"(need {MIN_SAMPLES} completed signals per duration)"
+        )
+
+    label = duration_label(market, best_d)
+
+    if not beats_baseline(market, contract, best_d):
+        return (
+            f"NO PROVEN EDGE - highest so far is {label}, "
+            "but it is within normal random variation"
+        )
+
+    return f"{label} - beats the plain hit rate beyond random noise"
+
+
+# ============================================================
+# SIGNAL ALERT
 # ============================================================
 
 def c(text, code):
@@ -142,657 +781,192 @@ def c(text, code):
     return f"\033[{code}m{text}\033[0m"
 
 
-def norm_cdf(x):
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+def plain_duration(market, contract):
+    """(ticks, text, note): the suggested duration in plain words."""
+    best_d = best_duration(market, contract)
+
+    if best_d is None:
+        ticks = 1
+        note = "still collecting results, so 1 tick is only a default"
+    elif beats_baseline(market, contract, best_d):
+        ticks = best_d
+        note = "has beaten the normal win rate on this market"
+    else:
+        ticks = best_d
+        note = "leading so far, but not proven better than the others"
 
-
-def local_time():
-    return datetime.now().strftime("%H:%M:%S")
-
-
-def ready():
-    return all(len(prices[m]) >= SIGMA_WINDOW for m in MARKETS)
-
-
-# ============================================================
-# MARKET MEASUREMENTS
-# ============================================================
-
-def tick_sigma(market):
-    """Typical price move per tick (root mean square of changes)."""
-    values = list(prices[market])[-SIGMA_WINDOW:]
-
-    if len(values) < 30:
-        return None
-
-    moves = [b - a for a, b in zip(values, values[1:])]
-
-    return math.sqrt(sum(x * x for x in moves) / len(moves))
-
-
-def avg_gap(market):
-    gaps = tick_gaps[market]
-
-    if len(gaps) < 5:
-        return None
-
-    return sum(gaps) / len(gaps)
-
-
-def barrier_points(market, ticks, z):
-    """Barrier distance in price points, rounded to the market's pip."""
-    sigma = tick_sigma(market)
-    step = 10 ** (-pip[market])
-
-    raw = z * sigma * math.sqrt(ticks)
-
-    return max(round(raw, pip[market]), step)
-
-
-def touch_probability(market, ticks, barrier):
-    """
-    Chance a driftless random walk touches a barrier within `ticks`
-    ticks (reflection principle with a correction for discrete ticks).
-    """
-    sigma = tick_sigma(market)
-
-    effective = barrier + DISCRETE_SHIFT * sigma
-    z = effective / (sigma * math.sqrt(ticks))
-
-    return min(1.0, max(0.0, 2 * (1 - norm_cdf(z))))
-
-
-def excursions(market, ticks):
-    """Largest move up and down within `ticks` ticks, for every start."""
-    values = list(prices[market])
-    result = []
-
-    for i in range(len(values) - ticks):
-        start = values[i]
-        window = values[i + 1:i + ticks + 1]
-        result.append((max(window) - start, start - min(window)))
-
-    return result
-
-
-def history_touch_rate(exc, barrier):
-    """How often a barrier was touched in the stored history."""
-    if not exc:
-        return None
-
-    hits = 0
-
-    for up, down in exc:
-        hits += (up >= barrier) + (down >= barrier)
-
-    return hits / (2 * len(exc))
-
-
-# ============================================================
-# HISTORY AND LIVE TICKS
-# ============================================================
-
-def record_gap(market, epoch):
-    prev = last_epoch[market]
-
-    if prev > 0 and epoch > prev:
-        tick_gaps[market].append(epoch - prev)
-
-
-def process_history(market, price_list, time_list):
-    pairs = sorted(zip(price_list, time_list), key=lambda x: int(x[1]))
-
-    prices[market].clear()
-    tick_gaps[market].clear()
-    last_epoch[market] = 0
-    last_price[market] = None
-
-    for price, epoch in pairs:
-        epoch = int(epoch)
-
-        record_gap(market, epoch)
-        prices[market].append(float(price))
-
-        last_epoch[market] = epoch
-        last_price[market] = price
-
-    history_ready[market] = True
-
-    print(f"{market}: loaded {len(prices[market])} historical ticks")
-
-
-def process_live(market, price, epoch):
-    epoch = int(epoch)
-
-    if epoch < last_epoch[market]:
-        return
-
-    if epoch == last_epoch[market] and price == last_price[market]:
-        return
-
-    record_gap(market, epoch)
-    prices[market].append(float(price))
-
-    last_epoch[market] = epoch
-    last_price[market] = price
-
-
-# ============================================================
-# OPTION TABLE
-# ============================================================
-
-def build_rows():
-    rows = []
-
-    for market in MARKETS:
-        if tick_sigma(market) is None:
-            continue
-
-        for ticks in TICK_DURATIONS:
-            exc = excursions(market, ticks)
-
-            for z in Z_LEVELS:
-                touch_quote = quotes.get((market, ticks, z, "ONETOUCH"))
-
-                if touch_quote and touch_quote.get("barrier") is not None:
-                    barrier = touch_quote["barrier"]
-                else:
-                    barrier = barrier_points(market, ticks, z)
-
-                p_model = touch_probability(market, ticks, barrier)
-                p_past = history_touch_rate(exc, barrier)
-
-                for ctype in ("ONETOUCH", "NOTOUCH"):
-                    if ctype == "ONETOUCH":
-                        chance = p_model
-                        past = p_past
-                    else:
-                        chance = 1 - p_model
-                        past = None if p_past is None else 1 - p_past
-
-                    quote = quotes.get((market, ticks, z, ctype))
-                    ratio = None
-
-                    if quote and quote.get("ratio"):
-                        ratio = quote["ratio"]
-
-                    value = None
-                    value_past = None
-
-                    if ratio is not None:
-                        value = chance * ratio - 1
-
-                        if past is not None:
-                            value_past = past * ratio - 1
-
-                    rows.append({
-                        "market": market,
-                        "ticks": ticks,
-                        "z": z,
-                        "ctype": ctype,
-                        "barrier": barrier,
-                        "chance": chance,
-                        "past": past,
-                        "ratio": ratio,
-                        "breakeven": 1 / chance if chance > 0 else None,
-                        "value": value,
-                        "value_past": value_past
-                    })
-
-    return rows
-
-
-def trade_name(ctype):
-    return "TOUCH" if ctype == "ONETOUCH" else "NO TOUCH"
-
-
-def time_text(market, ticks):
     gap = avg_gap(market)
+    text = f"{ticks} tick" + ("s" if ticks > 1 else "")
 
-    if gap is None:
-        return f"{ticks}t"
+    if gap is not None:
+        text += f" (about {ticks * gap:.0f} seconds)"
 
-    return f"{ticks}t (~{ticks * gap:.0f}s)"
-
-
-def pct(x):
-    return "-" if x is None else f"{x * 100:.0f}%"
+    return ticks, text, note
 
 
-# ============================================================
-# ALERT
-# ============================================================
+def miss_text(contract):
+    if contract == "OVER 1":
+        return "0 or 1"
 
-def check_alerts(rows):
-    for row in rows:
-        if row["value"] is None or row["value_past"] is None:
-            continue
+    return "8 or 9"
 
-        if row["value"] < VALUE_ALERT or row["value_past"] <= 0:
-            continue
 
-        key = (
-            row["market"], row["ticks"], row["z"],
-            row["ctype"], round(row["ratio"], 2)
-        )
+def past_result_text(market, contract, ticks):
+    wins, total = confirmed_record(market, contract, ticks)
 
-        if key in alerted:
-            continue
+    if total == 0:
+        return "no completed results yet"
 
-        alerted.add(key)
+    return f"{wins} of {total} won ({wins / total * 100:.0f}%)"
 
-        if SOUND:
-            print("\a", end="")
 
+def alert(market, contract):
+    signal = fresh_signal(market, contract)
+
+    if signal is None:
+        return
+
+    alert_key = (
+        market,
+        contract,
+        signal["epoch"],
+        signal["digit"]
+    )
+
+    if alert_key in alerted:
+        return
+
+    alerted.add(alert_key)
+
+    if not trend_confirms(market, contract, signal["trend"]):
+        allowed = "/".join(TREND_RULE.get(contract, TRENDS))
+
+        print(c(
+            f"  skipped: {market} {contract} - trend is "
+            f"{signal['trend']}, needs {allowed}",
+            "2"
+        ))
+        return
+
+    ticks, duration_text, note = plain_duration(market, contract)
+
+    if SOUND:
+        print("\a", end="")
+
+    print()
+    print(c("  " + "=" * 52, "92"))
+    print(c("   ENTRY SIGNAL   (analysis only, no trade placed)", "92;1"))
+    print(c("  " + "=" * 52, "92"))
+    print(f"   Market      : {market}")
+    print(f"   Trade       : {contract}")
+    print(f"   Enter       : on the NEXT tick")
+    print(f"   Hold for    : {duration_text}")
+    print(f"   Trend       : {signal['trend']} (agrees with the rule)")
+    print(
+        "   Past result : "
+        f"{past_result_text(market, contract, ticks)} at this duration"
+    )
+    print(f"   Duration    : {note}")
+    print(c(
+        "   Reminder    : winning ~80% still loses money long term.",
+        "93"
+    ))
+    print(c("  " + "=" * 52, "92"))
+
+    if VERBOSE:
         print()
-        print(c("  " + "=" * 56, "92"))
-        print(c("   POSSIBLE VALUE FOUND   (analysis only, no trade placed)",
-                "92;1"))
-        print(c("  " + "=" * 56, "92"))
-        print(f"   Market   : {row['market']}")
-        print(f"   Trade    : {trade_name(row['ctype'])}")
-        print(f"   Barrier  : +{row['barrier']:.{pip[row['market']]}f} "
-              f"from the entry price")
-        print(f"   Time     : {time_text(row['market'], row['ticks'])}")
-        print(f"   Chance   : {pct(row['chance'])} (model), "
-              f"{pct(row['past'])} (last {WINDOW} ticks)")
-        print(f"   Payout   : {row['ratio']:.2f}x stake")
-        print(f"   Value    : {row['value'] * 100:+.1f}% per $1 "
-              f"(model), {row['value_past'] * 100:+.1f}% (history)")
-        print(c("   Note     : check the payout on Deriv before acting; "
-                "it can change, and history is a small sample.", "93"))
-        print(c("  " + "=" * 56, "92"))
+        duration_table(market, contract)
+
 
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
-def classify(ratio):
-    if ratio < CALM_RATIO:
-        return "CALM"
-
-    if ratio > WILD_RATIO:
-        return "WILD"
-
-    return "NORMAL"
-
-
-def current_regime(market):
-    """(regime, ratio): is the market calmer or wilder than normal now?"""
-    values = list(prices[market])[-(SIGMA_WINDOW + 1):]
-
-    if len(values) < RECENT_TICKS + 30:
-        return None, None
-
-    moves = [b - a for a, b in zip(values, values[1:])]
-
-    recent = math.sqrt(
-        sum(x * x for x in moves[-RECENT_TICKS:]) / RECENT_TICKS
-    )
-    normal = math.sqrt(sum(x * x for x in moves) / len(moves))
-
-    if normal == 0:
-        return None, None
-
-    ratio = recent / normal
-
-    return classify(ratio), ratio
-
-
-def regime_history(market, ticks, z):
-    """
-    Look back over stored ticks: how often was the barrier touched
-    after a CALM, NORMAL or WILD market?
-    Returns {regime: [touches, trials]}.
-    """
-    values = list(prices[market])
-    count = len(values)
-    exc = excursions(market, ticks)
-    barrier = barrier_points(market, ticks, z)
-
-    prefix = [0.0]
-
-    for k in range(count - 1):
-        prefix.append(prefix[-1] + (values[k + 1] - values[k]) ** 2)
-
-    stats = {"CALM": [0, 0], "NORMAL": [0, 0], "WILD": [0, 0]}
-
-    for i in range(max(RECENT_TICKS, 200), len(exc)):
-        span = min(i, SIGMA_WINDOW)
-
-        recent = (prefix[i] - prefix[i - RECENT_TICKS]) / RECENT_TICKS
-        normal = (prefix[i] - prefix[i - span]) / span
-
-        if normal <= 0:
-            continue
-
-        regime = classify(math.sqrt(recent / normal))
-        up, down = exc[i]
-
-        stats[regime][0] += (up >= barrier) + (down >= barrier)
-        stats[regime][1] += 2
-
-    return stats
-
-
-def regime_evidence(stats, ticks):
-    """
-    Did the touch rate really differ after CALM / WILD markets?
-    Returns (text, {"CALM": bool, "WILD": bool}) where True means the
-    difference is bigger than random noise and points the way the rule
-    assumes (calm -> fewer touches, wild -> more touches).
-    """
-    touches = sum(v[0] for v in stats.values())
-    trials = sum(v[1] for v in stats.values())
-
-    if trials == 0:
-        return "not enough history", {"CALM": False, "WILD": False}
-
-    overall = touches / trials
-    supported = {"CALM": False, "WILD": False}
-
-    for name in ("CALM", "WILD"):
-        t, n = stats[name]
-
-        # overlapping starts are not independent, so shrink the sample
-        independent = n / ticks
-
-        if independent < 30:
-            continue
-
-        rate_here = t / n
-        std_err = math.sqrt(overall * (1 - overall) / independent)
-
-        if name == "CALM":
-            supported[name] = rate_here < overall - 3 * std_err
-        else:
-            supported[name] = rate_here > overall + 3 * std_err
-
-    if supported["CALM"] or supported["WILD"]:
-        return "rule supported by history", supported
-
-    return "no measurable effect", supported
-
-
-def entry_option(market, regime):
-    """The trade the rule suggests for this market right now."""
-    ctype = "NOTOUCH" if regime == "CALM" else "ONETOUCH"
-    ticks = TICK_DURATIONS[0]
-
-    quote = quotes.get((market, ticks, ENTRY_Z, ctype))
-    touch_quote = quotes.get((market, ticks, ENTRY_Z, "ONETOUCH"))
-
-    if touch_quote and touch_quote.get("barrier") is not None:
-        barrier = touch_quote["barrier"]
-    else:
-        barrier = barrier_points(market, ticks, ENTRY_Z)
-
-    p_touch = touch_probability(market, ticks, barrier)
-    chance = p_touch if ctype == "ONETOUCH" else 1 - p_touch
-
-    ratio = quote.get("ratio") if quote else None
-    value = None if ratio is None else chance * ratio - 1
-
-    return {
-        "ctype": ctype,
-        "ticks": ticks,
-        "barrier": barrier,
-        "chance": chance,
-        "ratio": ratio,
-        "breakeven": 1 / chance,
-        "value": value
-    }
-
-
-def check_entry_alert(market):
-    """Print an ENTRY box when a market newly turns CALM or WILD."""
-    regime, ratio = current_regime(market)
-    previous = last_regime[market]
-    last_regime[market] = regime
-
-    if regime not in ("CALM", "WILD") or regime == previous:
-        return
-
-    option = entry_option(market, regime)
-    stats = regime_history(market, option["ticks"], ENTRY_Z)
-    verdict, _ = regime_evidence(stats, option["ticks"])
-
-    if SOUND:
-        print("\a", end="")
-
-    print()
-    print(c("  " + "=" * 56, "92"))
-    print(c("   ENTRY SIGNAL   (analysis only, no trade placed)", "92;1"))
-    print(c("  " + "=" * 56, "92"))
-    print(f"   Market   : {market}")
-    print(f"   Trade    : {trade_name(option['ctype'])}")
-    print(f"   Why      : market just turned {regime} "
-          f"(moving {ratio:.2f}x its normal size)")
-    print(f"   Barrier  : +{option['barrier']:.{pip[market]}f}   "
-          f"Time: {time_text(market, option['ticks'])}")
-    print(f"   Chance   : {pct(option['chance'])} to win (model)")
-
-    if option["ratio"] is not None:
-        print(f"   Payout   : {option['ratio']:.2f}x stake   "
-              f"Value: {option['value'] * 100:+.0f}% per $1")
-    else:
-        print(f"   Payout   : needs at least {option['breakeven']:.2f}x "
-              f"stake to be worth it")
-
-    print(f"   Enter    : now; the signal ends when the market "
-          f"is no longer {regime}")
-    print(c(f"   Evidence : {verdict}", "93"))
-    print(c("  " + "=" * 56, "92"))
-
-
-def print_entry_section():
-    print()
-    print(c("  WHEN TO ENTER   (rule: calm market -> NO TOUCH, "
-            "wild market -> TOUCH)", "1"))
-    print(f"  {'Market':<9}{'Now':<9}{'Moving':<10}{'Signal'}")
-
-    for market in MARKETS:
-        regime, ratio = current_regime(market)
-
-        if regime is None:
-            print(f"  {market:<9}{'...':<9}")
-            continue
-
-        if regime == "NORMAL":
-            print(f"  {market:<9}{regime:<9}{ratio:.2f}x".ljust(30)
-                  + c("wait", "2"))
-            continue
-
-        option = entry_option(market, regime)
-        line = (
-            f"ENTER {trade_name(option['ctype'])} "
-            f"+{option['barrier']:.{pip[market]}f} "
-            f"{time_text(market, option['ticks'])}"
-        )
-
-        if option["ratio"] is not None:
-            line += (f"  payout {option['ratio']:.2f}x  "
-                     f"value {option['value'] * 100:+.0f}%")
-        else:
-            line += f"  needs {option['breakeven']:.2f}x or more"
-
-        print(f"  {market:<9}{regime:<9}{ratio:.2f}x".ljust(30)
-              + c(line, "92;1"))
-
-    print()
-    print("  Does the rule work? Touch rate in the last "
-          f"{WINDOW} ticks, split by market state:")
-
-    ticks = TICK_DURATIONS[0]
-
-    for market in MARKETS:
-        stats = regime_history(market, ticks, ENTRY_Z)
-        verdict, _ = regime_evidence(stats, ticks)
-
-        parts = []
-
-        for name in ("CALM", "NORMAL", "WILD"):
-            t, n = stats[name]
-            parts.append(f"{name.lower()} {pct(t / n if n else None)}")
-
-        print(f"    {market:<8}" + "   ".join(parts).ljust(40) + verdict)
-
-
-def print_ranking(title, ctype, rows):
-    """Rank the markets for one trade type, using each market's best option."""
-    best_per_market = {}
-
-    # rows are sorted best value first, so the first one seen is the best
-    for r in rows:
-        if r["ctype"] == ctype and r["market"] not in best_per_market:
-            best_per_market[r["market"]] = r
-
-    ranked = list(best_per_market.values())
-
-    if not ranked:
-        return
-
-    print()
-    print(c(f"  BEST MARKET FOR {title}   "
-            f"(best option found in each market)", "1"))
-    print(f"  {'#':<3}{'Market':<9}{'Barrier':<10}{'Time':<14}"
-          f"{'Chance':<8}{'Past':<7}{'Payout':<9}{'Value'}")
-
-    for i, r in enumerate(ranked, 1):
-        color = "92" if r["value"] > 0 else "91"
-        tag = "   <-- best" if i == 1 else ""
-
-        print(
-            f"  {i:<3}{r['market']:<9}"
-            f"+{r['barrier']:<9.{pip[r['market']]}f}"
-            f"{time_text(r['market'], r['ticks']):<14}"
-            f"{pct(r['chance']):<8}{pct(r['past']):<7}"
-            + f"{r['ratio']:.2f}x".ljust(9)
-            + c(f"{r['value'] * 100:+.0f}%", color)
-            + tag
-        )
-
-    gap = ranked[0]["value"] - ranked[-1]["value"]
-
-    if len(ranked) > 1 and gap < 0.03:
-        print(c(
-            f"  The markets are almost the same for {title} "
-            f"(only {gap * 100:.1f} points apart), so the ranking "
-            f"means little.",
-            "2"
-        ))
-
-
 def show():
     print()
-    print(c(f"  TOUCH / NO TOUCH ANALYZER    {local_time()} (your time)",
-            "96;1"))
-    print("  " + "-" * 70)
-    print(f"  {'Market':<9}{'Tick':<8}{'Normal move per tick':<24}"
-          f"{'Ticks stored'}")
+    print(c(
+        f"  DERIV ANALYZER    {datetime.now():%H:%M:%S} (your time)",
+        "96;1"
+    ))
+    print("  " + "-" * 56)
+    print(
+        f"  {'Market':<9}{'Last':<7}{'Trend':<8}"
+        f"{'Over 1':<9}{'Under 8':<9}{'Tick'}"
+    )
 
     for market in MARKETS:
-        sigma = tick_sigma(market)
-        gap = avg_gap(market)
+        digit = digits[market][-1] if digits[market] else "-"
+        over = f"{rate(market, 'OVER 1'):.0f}%"
+        under = f"{rate(market, 'UNDER 8'):.0f}%"
 
-        sigma_text = "-" if sigma is None else f"{sigma:.{pip[market] + 1}f}"
-        gap_text = "-" if gap is None else f"{gap:.1f}s"
+        print(
+            f"  {market:<9}{str(digit):<7}{trend_text(market):<8}"
+            f"{over:<9}{under:<9}{gap_text(market)}"
+        )
 
-        print(f"  {market:<9}{gap_text:<8}{sigma_text:<24}"
-              f"{len(prices[market])}/{WINDOW}")
-
-    print("  " + "-" * 70)
+    print("  " + "-" * 56)
+    print(c(
+        f"  Over 1 / Under 8 = how often each would have won in the "
+        f"last {WINDOW} ticks",
+        "2"
+    ))
 
     if not ready():
+        print()
         print("  Collecting history, please wait...")
-        return
-
-    rows = build_rows()
-
-    have_quotes = any(r["value"] is not None for r in rows)
-
-    if have_quotes:
-        rows = [r for r in rows if r["value"] is not None]
-        rows.sort(key=lambda r: r["value"], reverse=True)
-
-        print_ranking("TOUCH", "ONETOUCH", rows)
-        print_ranking("NO TOUCH", "NOTOUCH", rows)
-
-        best = rows[0]["value"]
-
-        print()
-        print("  Chance = estimated chance this trade wins.   "
-              "Past = how often it won in stored ticks.")
-        print("  Payout = what Deriv pays per $1 staked.   "
-              "Value = chance x payout - 1.")
-
-        if best <= 0:
-            print(c(
-                "  Verdict : NO VALUE. Every option is expected to lose "
-                "money (Deriv's payouts include a margin).",
-                "93"
-            ))
-        else:
-            print(c(
-                "  Verdict : a positive value appears. Treat it with "
-                "care: the estimate is rough and payouts change.",
-                "93"
-            ))
-
-        check_alerts(rows)
-
-    else:
-        print(c("  Payouts from Deriv are not available yet.", "93"))
-
-        if quote_errors:
-            print(f"  Reason: {quote_errors[0]}")
-
-        print()
-        print("  'Needs' = the lowest payout (x stake) at which that trade "
-              "is worth taking.")
-        print("  Compare it with the payout shown on Deriv: if Deriv pays "
-              "less, skip it.")
-
-        first = TICK_DURATIONS[0]
 
         for market in MARKETS:
-            mrows = [
-                r for r in rows
-                if r["market"] == market and r["ticks"] == first
-            ]
+            print(f"    {market:<7}{len(digits[market])}/{WINDOW}")
 
-            if not mrows:
-                continue
+        return
 
-            print()
-            print(c(f"  {market}   contract length: "
-                    f"{time_text(market, first)}", "1"))
-            print(f"    {'Barrier':<11}{'TOUCH wins':<12}{'needs':<10}"
-                  f"{'NO TOUCH wins':<15}{'needs'}")
-
-            for z in Z_LEVELS:
-                touch = next(r for r in mrows
-                             if r["z"] == z and r["ctype"] == "ONETOUCH")
-                notouch = next(r for r in mrows
-                               if r["z"] == z and r["ctype"] == "NOTOUCH")
-
-                barrier_text = f"+{touch['barrier']:.{pip[market]}f}"
-
-                print(
-                    "    "
-                    + barrier_text.ljust(11)
-                    + pct(touch["chance"]).ljust(12)
-                    + f"{touch['breakeven']:.2f}x".ljust(10)
-                    + pct(notouch["chance"]).ljust(15)
-                    + f"{notouch['breakeven']:.2f}x"
-                )
-
-    print_entry_section()
+    market, contract = best()
 
     print()
-    print(c("  No trade is placed. Prices are random, so direction "
-            "cannot be predicted.", "2"))
+    print(
+        f"  Watching : {market} {contract} "
+        f"({rate(market, contract):.0f}% wins recently)"
+    )
+
+    signal = fresh_signal(market, contract)
+
+    if signal and not trend_confirms(
+        market, contract, signal["trend"]
+    ):
+        allowed = "/".join(TREND_RULE.get(contract, TRENDS))
+
+        print(c(
+            f"  Status   : skipped - trend is {signal['trend']}, "
+            f"needs {allowed}",
+            "93"
+        ))
+    elif signal:
+        print(c(
+            "  Status   : SIGNAL - enter on the NEXT tick",
+            "92;1"
+        ))
+    else:
+        print(
+            "  Status   : waiting for a miss "
+            f"(a digit of {miss_text(contract)})"
+        )
+
+    ticks, duration_text, note = plain_duration(market, contract)
+
+    print(f"  Duration : {duration_text}")
+    print(c(f"             {note}", "2"))
+    print()
+    print(c(
+        "  No trade is placed. Digits are random, so a ~80% win rate "
+        "does not give a profit.",
+        "2"
+    ))
+
+    if VERBOSE:
+        print()
+        duration_table(market, contract)
+
 
 
 # ============================================================
@@ -800,7 +974,9 @@ def show():
 # ============================================================
 
 def connect():
-    ssl_options = {"cert_reqs": ssl.CERT_REQUIRED}
+    ssl_options = {
+        "cert_reqs": ssl.CERT_REQUIRED
+    }
 
     if CA_FILE:
         ssl_options["ca_certs"] = CA_FILE
@@ -810,21 +986,14 @@ def connect():
 
         try:
             ws = websocket.create_connection(
-                url, timeout=20, sslopt=ssl_options
+                url,
+                timeout=20,
+                sslopt=ssl_options
             )
 
             ws.settimeout(2)
 
             print("CONNECTED SUCCESSFULLY:", url)
-
-            SYMBOL_FIELD[0] = (
-                "underlying_symbol"
-                if "api.derivws.com" in url
-                else "symbol"
-            )
-            field_fix["toggled"] = False
-            field_fix["requote"] = False
-
             return ws
 
         except Exception as e:
@@ -833,111 +1002,39 @@ def connect():
     return None
 
 
+# ============================================================
+# SUBSCRIPTIONS
+# ============================================================
+
 def subscribe(ws):
     for market in MARKETS:
-        ws.send(json.dumps({
+        request = {
             "ticks_history": market,
             "count": WINDOW,
             "end": "latest",
             "style": "ticks",
             "subscribe": 1
-        }))
+        }
+
+        ws.send(json.dumps(request))
 
         print("Requested:", market)
-
-
-def request_quotes(ws):
-    """Ask Deriv for the payout of every option in the table."""
-    req_map.clear()
-    quote_errors.clear()
-
-    for market in MARKETS:
-        if tick_sigma(market) is None:
-            continue
-
-        for ticks in TICK_DURATIONS:
-            for z in Z_LEVELS:
-                barrier = barrier_points(market, ticks, z)
-
-                for ctype in ("ONETOUCH", "NOTOUCH"):
-                    req_counter[0] += 1
-                    req_id = req_counter[0]
-
-                    key = (market, ticks, z, ctype)
-                    req_map[req_id] = key
-                    quotes[key] = {"barrier": barrier, "ratio": None}
-
-                    ws.send(json.dumps({
-                        "proposal": 1,
-                        "req_id": req_id,
-                        "amount": STAKE,
-                        "basis": "stake",
-                        "contract_type": ctype,
-                        "currency": CURRENCY,
-                        "duration": ticks,
-                        "duration_unit": "t",
-                        SYMBOL_FIELD[0]: market,
-                        "barrier": f"+{barrier:.{pip[market]}f}"
-                    }))
-
-                    time.sleep(0.05)
-
-
-def handle_proposal(msg):
-    req_id = msg.get("req_id") or msg.get("echo_req", {}).get("req_id")
-    key = req_map.get(req_id)
-
-    if key is None:
-        return False
-
-    if "error" in msg:
-        message = msg["error"].get("message", str(msg["error"]))
-
-        quotes[key]["ratio"] = None
-        quotes[key]["error"] = message
-
-        if message not in quote_errors:
-            quote_errors.append(message)
-
-        if (
-            "symbol" in message
-            and "validation" in message.lower()
-            and not field_fix["toggled"]
-        ):
-            SYMBOL_FIELD[0] = (
-                "symbol"
-                if SYMBOL_FIELD[0] == "underlying_symbol"
-                else "underlying_symbol"
-            )
-            field_fix["toggled"] = True
-            field_fix["requote"] = True
-
-        return True
-
-    proposal = msg.get("proposal", {})
-    payout = proposal.get("payout")
-    cost = proposal.get("ask_price")
-
-    if payout and cost:
-        quotes[key]["ratio"] = float(payout) / float(cost)
-
-    return True
 
 
 # ============================================================
 # WEBSOCKET LOOP
 # ============================================================
 
-def run(ws):
+def run(ws, tick_writer, signal_writer, tick_file, signal_file):
     subscribe(ws)
 
     last_show = time.time()
     last_ping = time.time()
-    last_quote = 0
 
     while True:
         try:
             raw = ws.recv()
+
         except websocket.WebSocketTimeoutException:
             raw = None
 
@@ -947,36 +1044,69 @@ def run(ws):
         if raw:
             msg = json.loads(raw)
 
-            if msg.get("msg_type") == "proposal":
-                handle_proposal(msg)
+            # ------------------------------------------------
+            # ERROR
+            # ------------------------------------------------
 
-            elif "error" in msg:
-                if not handle_proposal(msg):
-                    print("Deriv error:",
-                          msg["error"].get("message", msg["error"]))
+            if "error" in msg:
+                print(
+                    "Deriv error:",
+                    msg["error"].get("message", msg["error"])
+                )
+
+            # ------------------------------------------------
+            # HISTORY RESPONSE
+            # ------------------------------------------------
 
             elif msg.get("msg_type") == "history":
-                market = msg.get("echo_req", {}).get("ticks_history")
+                market = (
+                    msg.get("echo_req", {})
+                    .get("ticks_history")
+                )
 
-                if market in MARKETS:
-                    history = msg.get("history", {})
+                if market not in MARKETS:
+                    continue
 
-                    pip[market] = int(msg.get("pip_size", pip[market]))
+                history = msg.get("history", {})
 
-                    process_history(
+                prices = history.get("prices", [])
+                times = history.get("times", [])
+
+                decimals[market] = int(
+                    msg.get("pip_size", decimals[market])
+                )
+
+                process_history(
+                    market,
+                    prices,
+                    times
+                )
+
+                # Process buffered live ticks that arrived
+                # while historical data was loading.
+
+                buffered = list(live_buffer[market])
+                live_buffer[market].clear()
+
+                buffered.sort(
+                    key=lambda t: int(t["epoch"])
+                )
+
+                for tick in buffered:
+                    process_live(
                         market,
-                        history.get("prices", []),
-                        history.get("times", [])
+                        tick["quote"],
+                        tick["epoch"],
+                        tick_writer,
+                        signal_writer
                     )
 
-                    buffered = sorted(
-                        live_buffer[market],
-                        key=lambda t: int(t["epoch"])
-                    )
-                    live_buffer[market].clear()
+                tick_file.flush()
+                signal_file.flush()
 
-                    for tick in buffered:
-                        process_live(market, tick["quote"], tick["epoch"])
+            # ------------------------------------------------
+            # LIVE TICK
+            # ------------------------------------------------
 
             elif msg.get("msg_type") == "tick":
                 tick = msg.get("tick", {})
@@ -985,18 +1115,48 @@ def run(ws):
                 price = tick.get("quote")
                 epoch = tick.get("epoch")
 
-                if market in MARKETS and price is not None \
-                        and epoch is not None:
+                if market not in MARKETS:
+                    continue
 
-                    if history_ready[market]:
-                        process_live(market, price, epoch)
+                if price is None or epoch is None:
+                    continue
 
-                        if ready():
-                            check_entry_alert(market)
-                    else:
-                        live_buffer[market].append(
-                            {"quote": price, "epoch": epoch}
-                        )
+                # Buffer ticks until history has arrived.
+
+                if not history_ready[market]:
+                    live_buffer[market].append({
+                        "quote": price,
+                        "epoch": epoch
+                    })
+                    continue
+
+                accepted = process_live(
+                    market,
+                    price,
+                    epoch,
+                    tick_writer,
+                    signal_writer
+                )
+
+                if accepted:
+                    tick_file.flush()
+                    signal_file.flush()
+
+                    if ready():
+                        best_market, best_contract = best()
+
+                        if fresh_signal(
+                            best_market, best_contract
+                        ) is not None:
+
+                            alert(
+                                best_market,
+                                best_contract
+                            )
+
+        # ----------------------------------------------------
+        # PING
+        # ----------------------------------------------------
 
         now = time.time()
 
@@ -1004,16 +1164,16 @@ def run(ws):
             ws.send(json.dumps({"ping": 1}))
             last_ping = now
 
-        if field_fix["requote"]:
-            field_fix["requote"] = False
-            last_quote = 0
-
-        if ready() and now - last_quote >= PROPOSAL_EVERY:
-            request_quotes(ws)
-            last_quote = time.time()
+        # ----------------------------------------------------
+        # DASHBOARD
+        # ----------------------------------------------------
 
         if now - last_show >= SHOW_EVERY:
             show()
+
+            tick_file.flush()
+            signal_file.flush()
+
             last_show = now
 
 
@@ -1022,57 +1182,111 @@ def run(ws):
 # ============================================================
 
 def main():
-    retry_delay = 5
+    os.system("")  # lets Windows terminals show colours
+    load_records()
 
-    try:
-        os.system("")  # lets Windows terminals show colours
+    with open(
+        TICK_FILE,
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as tick_file:
 
-        while True:
-            ws = connect()
+        tick_writer = csv.writer(tick_file)
 
-            if ws is None:
-                print()
-                print(c("  Cannot reach Deriv. This is usually your "
-                        "internet or DNS, not the bot.", "93"))
-                print("  Check that you are online, turn off any VPN, "
-                      "and try again.")
-                print(f"  Retrying in {retry_delay} seconds "
-                      f"(press Ctrl+C to stop).")
+        if tick_file.tell() == 0:
+            tick_writer.writerow([
+                "time_utc",
+                "market",
+                "price",
+                "last_digit"
+            ])
 
-                time.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 60)
-                continue
+        with open(
+            SIGNAL_FILE,
+            "a",
+            newline="",
+            encoding="utf-8"
+        ) as signal_file:
+
+            signal_writer = csv.writer(signal_file)
+
+            if signal_file.tell() == 0:
+                signal_writer.writerow([
+                    "trigger_time_utc",
+                    "market",
+                    "contract",
+                    "trigger_digit",
+                    "duration",
+                    "result_time_utc",
+                    "result_digit",
+                    "win",
+                    "trend"
+                ])
 
             retry_delay = 5
 
-            for market in MARKETS:
-                history_ready[market] = False
-                live_buffer[market].clear()
-
-            quotes.clear()
-            req_map.clear()
-
             try:
-                run(ws)
+                while True:
+                    ws = connect()
+
+                    if ws is None:
+                        print(
+                            f"All endpoints failed. "
+                            f"Retrying in {retry_delay} seconds."
+                        )
+
+                        time.sleep(retry_delay)
+
+                        retry_delay = min(
+                            retry_delay * 2,
+                            60
+                        )
+
+                        continue
+
+                    retry_delay = 5
+
+                    # Reset connection state.
+
+                    for market in MARKETS:
+                        history_ready[market] = False
+                        live_buffer[market].clear()
+                        for contract in CONTRACTS:
+                            active[(market, contract)] = []
+
+                    try:
+                        run(
+                            ws,
+                            tick_writer,
+                            signal_writer,
+                            tick_file,
+                            signal_file
+                        )
+
+                    except KeyboardInterrupt:
+                        raise
+
+                    except Exception as e:
+                        print("\nConnection interrupted:", e)
+                        print("Reconnecting...")
+
+                    finally:
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
+
+                    time.sleep(retry_delay)
 
             except KeyboardInterrupt:
-                raise
-
-            except Exception as e:
-                print("\nConnection interrupted:", e)
-                print("Reconnecting...")
-
-            finally:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-
-            time.sleep(retry_delay)
-
-    except KeyboardInterrupt:
-        print("\n")
-        print("ANALYZER STOPPED. No trades were placed.")
+                print("\n")
+                print("=" * 65)
+                print("ANALYZER STOPPED")
+                print("Ticks saved:", TICK_FILE)
+                print("Signals saved:", SIGNAL_FILE)
+                print("No trades were placed.")
+                print("=" * 65)
 
 
 if __name__ == "__main__":
